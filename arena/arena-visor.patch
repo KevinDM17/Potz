@@ -1,0 +1,185 @@
+diff --git a/cmd/arena/main.go b/cmd/arena/main.go
+index b3c2a59..9e4ffe7 100644
+--- a/cmd/arena/main.go
++++ b/cmd/arena/main.go
+@@ -61,7 +61,7 @@ func imprimirUso() {
+ 	fmt.Fprintln(os.Stderr, `uso: arena <comando> [opciones]
+ 
+ comandos:
+-  correr   -config <archivo.json> [-casino-db <db>] [-salida <dir>] [-verboso]
++  correr   -config <archivo.json> [-casino-db <db>] [-salida <dir>] [-verboso] [-visor-en-vivo]
+            Juega el torneo entero y escribe los resultados.
+   validar  -config <archivo.json>
+            Revisa la configuración y muestra los emparejamientos, sin jugar.
+@@ -86,6 +86,7 @@ func correr(args []string) {
+ 	casinoDB := fs.String("casino-db", "", "archivo del Casino: valida a los participantes contra cuentas reales y reporta el resultado al ranking")
+ 	salida := fs.String("salida", "", "directorio de salida (pisa el del archivo de configuración)")
+ 	verboso := fs.Bool("verboso", false, "muestra en la terminal el stdout y stderr de los bots")
++	visor := fs.Bool("visor-en-vivo", false, "emite el estado de la mesa y espera al visor local entre jugadas")
+ 	direccion := fs.String("host", "127.0.0.1", "host en el que escuchan las mesas. Usar 0.0.0.0 solo si los bots son remotos")
+ 	fs.Parse(args)
+ 
+@@ -96,6 +97,9 @@ func correr(args []string) {
+ 	if *salida != "" {
+ 		cfg.Salida = *salida
+ 	}
++	if *visor && cfg.Formato != "mesa-unica" {
++		fatal("el visor en vivo requiere el formato mesa-unica")
++	}
+ 
+ 	formato, err := arena.BuscarFormato(cfg.Formato, cfg)
+ 	if err != nil {
+@@ -155,6 +159,9 @@ func correr(args []string) {
+ 		Direccion: *direccion,
+ 		Log:       log.Default(),
+ 	}
++	if *visor {
++		torneo.ObservarEstado = observadorEnVivo(ctx, cancelar)
++	}
+ 
+ 	clasificacion, resultados, err := torneo.Correr(ctx)
+ 	if err != nil {
+diff --git a/internal/arena/arena.go b/internal/arena/arena.go
+index a7015f2..237e4d4 100644
+--- a/internal/arena/arena.go
++++ b/internal/arena/arena.go
+@@ -211,6 +211,8 @@ type Torneo struct {
+ 	Validar ValidarToken
+ 	// Historial, si no es nil, recibe cada mano jugada. Se cierra al terminar.
+ 	Historial Historial
++	// ObservarEstado recibe actualizaciones de las mesas para el visor local.
++	ObservarEstado mesa.ObservadorEstado
+ 	// Log recibe el progreso del torneo. Si es nil, se usa el logger estándar.
+ 	Log *log.Logger
+ 
+@@ -357,9 +359,10 @@ func (t *Torneo) jugarEnfrentamiento(ctx context.Context, e Enfrentamiento) Resu
+ 	cpr := t.Config.CrupierPara(e)
+ 
+ 	cfgMesa := mesa.ConfigMesa{
+-		MaxJugadores: uint8(len(participantes)),
+-		MinJugadores: uint8(len(participantes)),
+-		Timeout:      t.Config.Mesa.TimeoutMs,
++		MaxJugadores:   uint8(len(participantes)),
++		MinJugadores:   uint8(len(participantes)),
++		Timeout:        t.Config.Mesa.TimeoutMs,
++		ObservarEstado: t.ObservarEstado,
+ 	}
+ 	if t.Historial != nil {
+ 		cfgMesa.Observador = t.Historial.Observador(e.ID)
+diff --git a/internal/mesa/mesa.go b/internal/mesa/mesa.go
+index e52f65b..7aa0d17 100644
+--- a/internal/mesa/mesa.go
++++ b/internal/mesa/mesa.go
+@@ -89,8 +89,14 @@ type ConfigMesa struct {
+ 	// extensión para historiales de mano, replays o telemetría: la Mesa no
+ 	// sabe qué se hace con eso (ver internal/arena/historial.go).
+ 	Observador ObservadorMano
++
++	ObservarEstado ObservadorEstado
+ }
+ 
++// ObservadorEstado se usa para el visor local. Privadas solo se envía al
++// repartir y nunca forma parte de los mensajes del protocolo a los bots.
++type ObservadorEstado func(estado protocolo.EstadoPublico, privadas map[string]protocolo.Mano, resultado *protocolo.ResultadoMano)
++
+ // ManoJugada es una mano ya terminada, con todo lo necesario para
+ // reconstruirla. Se pasa como estructura y no como lista de parámetros para
+ // poder agregarle campos sin romper a quien ya implemente ObservadorMano.
+@@ -703,6 +709,9 @@ func (m *Mesa) repartirPozo(jugadoresActivos []*Jugador, idMano string) error {
+ 	m.Mu.Unlock()
+ 
+ 	m.enviarManoFin(jugadoresActivos, resultado)
++	if observar := m.CfgMesa.ObservarEstado; observar != nil {
++		observar(estado, nil, &resultado)
++	}
+ 	if observador != nil {
+ 		observador.ManoTerminada(ManoJugada{
+ 			IDMesa:    m.ID,
+@@ -991,8 +1000,19 @@ func (m *Mesa) enviarManoInicio(jugadores []*Jugador) {
+ 	m.Mu.Lock()
+ 	estado := m.estadoSinLock()
+ 	timeout := m.CfgMesa.Timeout
++	observar := m.CfgMesa.ObservarEstado
++	var privadas map[string]protocolo.Mano
++	if observar != nil {
++		privadas = make(map[string]protocolo.Mano, len(jugadores))
++		for _, jugador := range jugadores {
++			privadas[jugador.ID] = jugador.CartasPrivadas
++		}
++	}
+ 	m.Mu.Unlock()
+ 
++	if observar != nil {
++		observar(estado, privadas, nil)
++	}
+ 	enviarAVarios(jugadores, timeout, func(j *Jugador) protocolo.MensajeMesa {
+ 		mano := j.CartasPrivadas
+ 		return protocolo.MensajeMesa{
+@@ -1052,6 +1072,9 @@ func (m *Mesa) difundirEstado(exceptoSilla int) {
+ 	timeout := m.CfgMesa.Timeout
+ 	m.Mu.Unlock()
+ 
++	if observar := m.CfgMesa.ObservarEstado; observar != nil {
++		observar(estado, nil, nil)
++	}
+ 	msg := protocolo.MensajeMesa{Tipo: protocolo.MsgEstado, Version: protocolo.VersionProtocolo, Estado: &estado}
+ 	if exceptoSilla >= 0 && exceptoSilla < len(jugadores) {
+ 		jugadores[exceptoSilla] = nil // Quien acaba de actuar ya conoce el resultado.
+diff --git a/cmd/arena/visor.go b/cmd/arena/visor.go
+new file mode 100644
+index 0000000..8c7fe98
+--- /dev/null
++++ b/cmd/arena/visor.go
+@@ -0,0 +1,52 @@
++package main
++
++import (
++	"bufio"
++	"context"
++	"encoding/json"
++	"os"
++
++	"github.com/aicspucp/pokerfight-arena-participantes/internal/mesa"
++	"github.com/aicspucp/pokerfight-arena-participantes/internal/protocolo"
++)
++
++type eventoEnVivo struct {
++	Tipo      string                    `json:"tipo"`
++	Estado    protocolo.EstadoPublico   `json:"estado"`
++	Privadas  map[string]protocolo.Mano `json:"privadas,omitempty"`
++	Resultado *protocolo.ResultadoMano  `json:"resultado,omitempty"`
++}
++
++func observadorEnVivo(ctx context.Context, cancelar context.CancelFunc) mesa.ObservadorEstado {
++	avanzar := make(chan struct{})
++	go func() {
++		entrada := bufio.NewScanner(os.Stdin)
++		for entrada.Scan() {
++			if entrada.Text() == "avanzar" {
++				select {
++				case avanzar <- struct{}{}:
++				case <-ctx.Done():
++					return
++				}
++			}
++		}
++		cancelar()
++	}()
++
++	salida := json.NewEncoder(os.Stdout)
++	return func(estado protocolo.EstadoPublico, privadas map[string]protocolo.Mano, resultado *protocolo.ResultadoMano) {
++		if ctx.Err() != nil {
++			return
++		}
++		evento := eventoEnVivo{Tipo: "mesa_en_vivo", Estado: estado, Privadas: privadas, Resultado: resultado}
++		if salida.Encode(evento) != nil {
++			cancelar()
++			return
++		}
++		// Espera entre turnos, antes de que empiece el plazo de la próxima jugada.
++		select {
++		case <-avanzar:
++		case <-ctx.Done():
++		}
++	}
++}

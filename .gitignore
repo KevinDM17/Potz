@@ -1,0 +1,9 @@
+/arena/pokerfight-arena-participantes/
+/datos/
+__pycache__/
+*.py[cod]
+/.venv/
+.env
+.env.*
+*.sqlite
+*.sqlite-*

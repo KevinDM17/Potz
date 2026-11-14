@@ -1,0 +1,22 @@
+{
+  "nombre": "Potz - partida local",
+  "formato": "mesa-unica",
+  "puntuacion": "neto",
+  "manos_por_enfrentamiento": 0,
+  "semilla_secreta": "auto",
+  "guardar_historial": true,
+  "salida": "arena/pokerfight-arena-participantes/resultados/prueba-local",
+  "mesa": {
+    "ciega_chica": 50,
+    "ciega_grande": 100,
+    "stack": 10000,
+    "timeout_ms": 5000
+  },
+  "participantes": [
+    { "id": "potz", "nombre": "Potz (tu bot)", "comando": ["python", "-B", "-m", "potz.bot_arena"] },
+    { "id": "aleatorio", "nombre": "Aleatorio", "comando": ["./arena/pokerfight-arena-participantes/bin/aleatorio.exe"] },
+    { "id": "estadistico", "nombre": "Estadistico", "comando": ["./arena/pokerfight-arena-participantes/bin/estadistico.exe", "-simulaciones", "2000"] },
+    { "id": "novato", "nombre": "Michi Novato", "comando": ["python", "-B", "arena/pokerfight-arena-participantes/bots/novato/bot.py", "-silencioso"] },
+    { "id": "python", "nombre": "Ejemplo Python", "comando": ["python", "-B", "arena/pokerfight-arena-participantes/bots/ejemplos/python/bot.py"] }
+  ]
+}
