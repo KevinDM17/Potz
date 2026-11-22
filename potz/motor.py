@@ -209,24 +209,31 @@ def _preflop(s, facing_raise):
     amount = min(s.stack, max(s.min_raise or 0, 3 * call, s.pot if not call else 0))
     shove = amount >= s.stack * 0.5
 
-    def dec(action, amt, why):
-        return Decision(action, amt, eq, req, why)
+    def dec(action, amt, why, e=None):
+        return Decision(action, amt, eq if e is None else e, req, why)
 
     if facing_raise:
-        if score >= 14 and can_raise:
-            return dec("Subir", amount, "Mano premium: resube por valor.")
-        if score >= 10 and call <= s.stack * 0.15:
-            return dec("Pagar", call, "Mano fuerte: paga la subida.")
-        return dec("Retirarse", 0, "Mano insuficiente contra una subida.")
+        eq_r = estimate_equity(replace(s, opponents=1), samples=600,
+                               strong_rival=True, strong_weight=0.5)
+        if score >= 14 and can_raise and call < s.stack * 0.35:
+            return dec("Subir", amount, "Mano premium: resube por valor.", eq_r)
+        margin = 0.08 if call <= s.stack * 0.25 else 0.15
+        if score >= 14 or eq_r >= (req or 0) + margin:
+            return dec("Pagar", call, "Las pot odds contra el rango rival justifican pagar.", eq_r)
+        return dec("Retirarse", 0, "Mano insuficiente contra una subida.", eq_r)
+
+
     if score >= 9 and can_raise and not (shove and score < 14):
         return dec("Subir" if call else "Apostar / subir", amount,
                    "Mano jugable: sube para tomar la iniciativa.")
     if not call:
         return dec("Pasar", 0, "Puedes seguir sin poner fichas.")
     limit = 0.25 if score >= 9 else 0.06
-    if score >= 6 and call <= s.stack * limit:
-        return dec("Pagar", call, "Mano especulativa barata.")
+    if (score >= 6 and call <= s.stack * limit) or (call <= s.stack * 0.05 and eq >= req + 0.10):
+        return dec("Pagar", call, "Mano jugable o pot odds favorables.")
     return dec("Retirarse", 0, "Mano débil.")
+
+
 def _decide(situation, strong_weight, facing_raise):
     if not situation.board:
         return _preflop(situation, facing_raise), 0.0
@@ -244,15 +251,21 @@ def _decide(situation, strong_weight, facing_raise):
         strong_rival = True
     if postflop_raise or (large_bet and len(situation.board) >= 4):
         weight = max(weight, 0.75)
-    if postflop_raise and len(situation.board) >= 4:
-        weight, fraction = max(weight, 0.85), 10
-
     if not call and len(situation.board) >= 4:
         weight, strong_rival = 0.35, True
+
+    # Bote grande o pago grande respecto al stack: el rival tiene una mano fuerte
+    heavy = (postflop_raise
+             or call >= situation.stack * 0.25
+             or situation.pot >= situation.stack * 0.3)
+    if heavy:
+        weight, fraction, strong_rival = max(weight, 0.85), 10, True
 
     equity = estimate_equity(
         situation, strong_rival=strong_rival, strong_weight=weight, fraction=fraction,
     )
+
+
     required = call / (situation.pot + call) if call else None
 
     reraise_caution = ""
@@ -262,7 +275,9 @@ def _decide(situation, strong_weight, facing_raise):
     raise_min = situation.min_raise
     target = call + max(1, (situation.pot + call) // 2)
 
-    value_threshold = 0.66 if situation.opponents == 1 else 0.55
+    value_threshold = 0.66 if situation.opponents == 1 else 1 / (situation.opponents + 1) + 0.25
+
+
     if len(situation.board) == 5 and hand_rank(situation.board + situation.hole)[0] < 2:
         value_threshold = max(value_threshold, 0.80)
     if call:
@@ -289,7 +304,8 @@ def _decide(situation, strong_weight, facing_raise):
             not call
             and raise_min is not None
             and situation.pot > 0
-            and equity >= (0.55 if situation.opponents == 1 else 0.45)
+            and equity >= (0.55 if situation.opponents == 1 else 1 / (situation.opponents + 1) + 0.10)
+
     ):
         probe_amount = min(situation.stack, max(raise_min, situation.pot // 3))
         if probe_amount < situation.stack * 0.4:
@@ -306,7 +322,7 @@ def _decide(situation, strong_weight, facing_raise):
         ), weight
 
     big = 0.10 if call >= situation.stack * 0.25 else 0.0
-    if equity >= required + big:
+    if equity >= required + 0.04 + big:
         explanation = "Tu parte estimada del bote cubre el coste de igualar la apuesta."
         if reraise_caution:
             explanation = f"La estimación alcanza para igualar, pero {reraise_caution}."
