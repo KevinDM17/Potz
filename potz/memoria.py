@@ -39,13 +39,13 @@ class ObservedHand:
         stage = action["etapa"]
         rival = action["id_jugador"]
         if (
-            self.previous is None
-            or stage not in BOARD_SIZE
-            or self.previous["etapa"] != stage
-            or state["etapa"] != stage
-            or rival == self.player_id
-            or action["accion"]["tipo"] not in AGGRESSIVE
-            or any(entry["id_jugador"] == rival for entry in skipped)
+                self.previous is None
+                or stage not in BOARD_SIZE
+                or self.previous["etapa"] != stage
+                or state["etapa"] != stage
+                or rival == self.player_id
+                or action["accion"]["tipo"] not in AGGRESSIVE
+                or any(entry["id_jugador"] == rival for entry in skipped)
         ):
             return
 
@@ -103,27 +103,27 @@ class Memory:
         self.hand_number = 0
         self.reported_error = False
         connection.executescript("""
-            CREATE TABLE IF NOT EXISTS acciones (
-                ambito TEXT NOT NULL,
-                sesion TEXT NOT NULL,
-                numero_mano INTEGER NOT NULL,
-                mano TEXT NOT NULL,
-                orden INTEGER NOT NULL,
-                rival TEXT NOT NULL,
-                etapa TEXT NOT NULL,
-                accion TEXT NOT NULL,
-                monto INTEGER,
-                apuesta_grande INTEGER NOT NULL,
-                cartas_mostradas TEXT,
-                fuerte INTEGER,
-                fecha TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (sesion, numero_mano, orden)
-            );
-            CREATE INDEX IF NOT EXISTS evidencia_por_rival
-            ON acciones (ambito, rival, etapa) WHERE fuerte IS NOT NULL;
-            CREATE INDEX IF NOT EXISTS evidencia_reciente_por_rival
-            ON acciones (ambito, rival, etapa, fecha) WHERE fuerte IS NOT NULL;
-        """)
+                                 CREATE TABLE IF NOT EXISTS acciones (
+                                                                         ambito TEXT NOT NULL,
+                                                                         sesion TEXT NOT NULL,
+                                                                         numero_mano INTEGER NOT NULL,
+                                                                         mano TEXT NOT NULL,
+                                                                         orden INTEGER NOT NULL,
+                                                                         rival TEXT NOT NULL,
+                                                                         etapa TEXT NOT NULL,
+                                                                         accion TEXT NOT NULL,
+                                                                         monto INTEGER,
+                                                                         apuesta_grande INTEGER NOT NULL,
+                                                                         cartas_mostradas TEXT,
+                                                                         fuerte INTEGER,
+                                                                         fecha TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                                                                         PRIMARY KEY (sesion, numero_mano, orden)
+                                     );
+                                 CREATE INDEX IF NOT EXISTS evidencia_por_rival
+                                     ON acciones (ambito, rival, etapa) WHERE fuerte IS NOT NULL;
+                                 CREATE INDEX IF NOT EXISTS evidencia_reciente_por_rival
+                                     ON acciones (ambito, rival, etapa, fecha) WHERE fuerte IS NOT NULL;
+                                 """)
 
     def report_error(self, error):
         if not self.reported_error:
@@ -137,11 +137,11 @@ class Memory:
         try:
             with self.connection:
                 self.connection.executemany("""
-                    INSERT INTO acciones
-                    (ambito, sesion, numero_mano, mano, orden, rival, etapa, accion, monto,
-                     apuesta_grande, cartas_mostradas, fuerte)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, rows)
+                                            INSERT INTO acciones
+                                            (ambito, sesion, numero_mano, mano, orden, rival, etapa, accion, monto,
+                                             apuesta_grande, cartas_mostradas, fuerte)
+                                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                            """, rows)
         except sqlite3.Error as error:
             self.report_error(error)
 
@@ -166,19 +166,19 @@ class Memory:
         key = (self.scope, rival, stage)
         if not self.scope.startswith("remoto:"):
             return self.connection.execute("""
-                SELECT COUNT(*), COUNT(*) - COALESCE(SUM(fuerte), 0)
-                FROM acciones
-                WHERE ambito = ? AND rival = ? AND etapa = ? AND fuerte IS NOT NULL
-            """, key).fetchone()
+                                           SELECT COUNT(*), COUNT(*) - COALESCE(SUM(fuerte), 0)
+                                           FROM acciones
+                                           WHERE ambito = ? AND rival = ? AND etapa = ? AND fuerte IS NOT NULL
+                                           """, key).fetchone()
 
         rows = self.connection.execute("""
-            SELECT fuerte
-            FROM acciones
-            WHERE ambito = ? AND rival = ? AND etapa = ? AND fuerte IS NOT NULL
-              AND fecha >= datetime('now', '-7 days')
-            ORDER BY fecha DESC, rowid DESC
-            LIMIT ?
-        """, (*key, REMOTE_SAMPLE_LIMIT))
+                                       SELECT fuerte
+                                       FROM acciones
+                                       WHERE ambito = ? AND rival = ? AND etapa = ? AND fuerte IS NOT NULL
+                                         AND fecha >= datetime('now', '-7 days')
+                                       ORDER BY fecha DESC, rowid DESC
+                                           LIMIT ?
+                                       """, (*key, REMOTE_SAMPLE_LIMIT))
 
         total = weak = 0.0
         for age, (strong,) in enumerate(rows):
@@ -194,7 +194,8 @@ def open_memory(scope, path=DATABASE):
     try:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            connection = sqlite3.connect(path, timeout=0.15)
+            connection = sqlite3.connect(path, timeout=1.5)
+            connection.execute("PRAGMA journal_mode=WAL;")
             memory = Memory(connection, scope)
         except (OSError, sqlite3.Error) as error:
             print(f"Potz: memoria no disponible ({error}). El bot sigue jugando.", file=sys.stderr)

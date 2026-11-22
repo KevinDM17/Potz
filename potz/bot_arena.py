@@ -80,7 +80,7 @@ def choose_action(state, valid_actions, player_id, hole, *, strong_weight=DEFAUL
         opponents=len(rivals),
         min_raise=min_raise,
     )
-    facing_raise = bool(situation.board and to_call and facing_postflop_pressure(state, player_id))
+    facing_raise = bool(to_call and facing_postflop_pressure(state, player_id))
     decision = decide(situation, strong_weight=strong_weight, facing_raise=facing_raise)
 
     if decision.amount > to_call:

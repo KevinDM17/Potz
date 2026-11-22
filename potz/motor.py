@@ -4,12 +4,17 @@ from collections import Counter
 from dataclasses import dataclass
 from itertools import combinations
 from random import Random
+import os
+import sys
+import time
 
+DEBUG = os.environ.get("POTZ_LOG") == "1"
+STAGES = {0: "preflop", 3: "flop", 4: "turn", 5: "river"}
 RANKS = "23456789TJQKA"
 SUITS = "cdhs"
 DECK = tuple(rank + suit for suit in SUITS for rank in RANKS)
 CARD_VALUES = {card: (RANKS.index(card[0]) + 2, card[1]) for card in DECK}
-DEFAULT_STRONG_WEIGHT = 0.75
+DEFAULT_STRONG_WEIGHT = 0.5
 CHEN_HIGH_CARD_POINTS = {14: 10, 13: 8, 12: 7, 11: 6}
 CHEN_GAP_PENALTIES = (0, 1, 2, 4, 5)
 LOW_TRIPS_KICKER_MAX = 9
@@ -125,7 +130,7 @@ def strong_combinations(board, remaining):
 
 
 def estimate_equity(
-    situation, samples=2400, *, strong_rival=False, strong_weight=DEFAULT_STRONG_WEIGHT,
+        situation, samples=2400, *, strong_rival=False, strong_weight=DEFAULT_STRONG_WEIGHT,
 ):
     seen = set(situation.hole + situation.board)
     remaining = [card for card in DECK if card not in seen]
@@ -149,7 +154,7 @@ def estimate_equity(
             return (1 - strong_weight) * share / count + strong_weight * strong_share / len(strong_set)
         return share / count
 
-    random = Random(42)
+    random = Random()
     share = 0.0
     for _ in range(samples):
         if strong_pairs and random.random() < strong_weight:
@@ -174,11 +179,37 @@ def estimate_equity(
 
 
 def decide(situation, *, strong_weight=DEFAULT_STRONG_WEIGHT, facing_raise=False):
+    started = time.perf_counter()
+    decision, weight = _decide(situation, strong_weight, facing_raise)
+    if DEBUG:
+        ms = (time.perf_counter() - started) * 1000
+        req = f"{decision.required_equity:.0%}" if decision.required_equity is not None else "-"
+        print(
+            f"[{STAGES[len(situation.board)]:<7}] {' '.join(situation.hole)} | "
+            f"mesa {' '.join(situation.board) or '-':<14} | "
+            f"eq {decision.equity:.0%} req {req} w{weight:.2f} vs {situation.opponents} "
+            f"pot {situation.pot} call {situation.to_call} stack {situation.stack} | "
+            f"{decision.action} {decision.amount} | t={ms:.0f}ms",
+            file=sys.stderr, flush=True,
+        )
+    return decision
+
+
+def _decide(situation, strong_weight, facing_raise):
     call = situation.to_call
-    large_bet = call > 0 and 2 * call >= situation.pot
+    large_bet = bool(situation.board) and call > 0 and 2 * call >= situation.pot
     postflop_raise = bool(situation.board and call and facing_raise)
-    strong_rival = large_bet or postflop_raise
-    equity = estimate_equity(situation, strong_rival=strong_rival, strong_weight=strong_weight)
+    preflop_raise = bool(not situation.board and call and facing_raise)
+    strong_rival = large_bet or postflop_raise or preflop_raise
+
+    # Rango rival escalado por tamaño de apuesta postflop
+    weight = strong_weight if strong_rival else 0.0
+    if call and situation.board and not strong_rival:
+        frac = call / max(1, situation.pot - call)
+        weight = min(0.85, 0.25 + 0.55 * frac)
+        strong_rival = True
+
+    equity = estimate_equity(situation, strong_rival=strong_rival, strong_weight=weight)
     required = call / (situation.pot + call) if call else None
     reraise_caution = ""
     if postflop_raise:
@@ -189,47 +220,74 @@ def decide(situation, *, strong_weight=DEFAULT_STRONG_WEIGHT, facing_raise=False
             trips = rank[1]
             board_ranks = [CARD_VALUES[card][0] for card in situation.board]
             if board_ranks.count(trips) == 2:
-                side_card = next(CARD_VALUES[card][0] for card in situation.hole
-                                 if CARD_VALUES[card][0] != trips)
+                side_card = next(
+                    CARD_VALUES[card][0] for card in situation.hole
+                    if CARD_VALUES[card][0] != trips
+                )
                 if side_card <= LOW_TRIPS_KICKER_MAX and any(
-                    kicker not in board_ranks for kicker in range(rank[-1] + 1, 15)
+                        kicker not in board_ranks for kicker in range(rank[-1] + 1, 15)
                 ):
                     reraise_caution = "otro trío podría ganarte con una carta de desempate más alta"
+
     raise_min = situation.min_raise
     target = call + max(1, (situation.pot + call) // 2)
-    value_threshold = 0.65 if situation.opponents == 1 else 0.55
+
+    # 1. Apostar / subir por valor (umbrales más exigentes)
+    value_threshold = 0.66 if situation.opponents == 1 else 0.55
     if call:
-        value_threshold += 0.05
+        value_threshold += 0.06
 
     avoid_all_in = False
     if (
-        not reraise_caution
-        and raise_min is not None
-        and (raise_min <= target or situation.pot == 0)
-        and equity >= value_threshold
+            not reraise_caution
+            and raise_min is not None
+            and (raise_min <= target or situation.pot == 0)
+            and equity >= value_threshold
     ):
         amount = min(situation.stack, max(raise_min, target))
-        avoid_all_in = bool(situation.board and amount == situation.stack and equity < 0.85)
+        committed = amount >= situation.stack * 0.5 and situation.pot >= situation.stack * 0.5
+        min_allin_equity = 0.70 if committed else (0.88 if situation.board else 0.84)
+        avoid_all_in = bool(amount == situation.stack and equity < min_allin_equity)
         if not avoid_all_in:
             return Decision(
                 "Subir" if call else "Apostar / subir", amount, equity, required,
                 "La mano tiene suficiente fuerza en la simulación para intentar ganar un bote mayor.",
-            )
+            ), weight
+
+    # 2. Apuesta de presión (1/3 del bote) cuando nadie apostó postflop
+    if (
+            not call
+            and situation.board
+            and raise_min is not None
+            and situation.pot > 0
+            and equity >= (0.55 if situation.opponents == 1 else 0.45)
+    ):
+        probe_amount = min(situation.stack, max(raise_min, situation.pot // 3))
+        if probe_amount < situation.stack * 0.4:
+            return Decision(
+                "Apostar / subir", probe_amount, equity, required,
+                "Ningún rival mostró fuerza; apuesta de presión para ganar el bote.",
+            ), weight
+
     if not call:
         return Decision(
             "Pasar", 0, equity, required,
             "La apuesta usaría todas tus fichas y la mano no tiene fuerza suficiente para hacerlo."
             if avoid_all_in else "Puedes seguir en la mano sin poner más fichas.",
-        )
-    if equity >= required:
+        ), weight
+
+    # 3. Filtro extra preflop para evitar igualar con manos basura
+    call_buffer = 0.08 if not situation.board else 0.0
+    if equity >= required + call_buffer:
         explanation = "Tu parte estimada del bote cubre el coste de igualar la apuesta."
         if reraise_caution:
             explanation = f"La estimación alcanza para igualar, pero {reraise_caution}."
-        return Decision(
-            "Pagar", call, equity, required, explanation,
-        )
+        elif avoid_all_in:
+            explanation = "Subir comprometería todas tus fichas sin suficiente margen; conviene solo igualar."
+        return Decision("Pagar", call, equity, required, explanation), weight
+
     return Decision(
         "Retirarse", 0, equity, required,
         "El bot da más peso a manos rivales fuertes. Con esa estimación, igualar cuesta demasiado."
         if strong_rival else "Igualar cuesta demasiado para la parte del bote que estima el bot.",
-    )
+    ), weight
