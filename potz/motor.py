@@ -247,6 +247,9 @@ def _decide(situation, strong_weight, facing_raise):
     if postflop_raise and len(situation.board) >= 4:
         weight, fraction = max(weight, 0.85), 10
 
+    if not call and len(situation.board) >= 4:
+        weight, strong_rival = 0.35, True
+
     equity = estimate_equity(
         situation, strong_rival=strong_rival, strong_weight=weight, fraction=fraction,
     )
@@ -260,6 +263,8 @@ def _decide(situation, strong_weight, facing_raise):
     target = call + max(1, (situation.pot + call) // 2)
 
     value_threshold = 0.66 if situation.opponents == 1 else 0.55
+    if len(situation.board) == 5 and hand_rank(situation.board + situation.hole)[0] < 2:
+        value_threshold = max(value_threshold, 0.80)
     if call:
         value_threshold += 0.06
 
