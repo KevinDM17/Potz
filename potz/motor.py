@@ -4,9 +4,14 @@ from collections import Counter
 from dataclasses import dataclass
 from itertools import combinations
 from random import Random
+from dataclasses import dataclass, replace
+
 import os
 import sys
 import time
+
+
+
 
 DEBUG = os.environ.get("POTZ_LOG") == "1"
 STAGES = {0: "preflop", 3: "flop", 4: "turn", 5: "river"}
@@ -121,21 +126,21 @@ def starting_hand_score(pair):
     return points + suited_bonus + connected_bonus - CHEN_GAP_PENALTIES[min(gap, 4)]
 
 
-def strong_combinations(board, remaining):
-    """El cuarto superior de manos, incluidos los empates en el corte."""
+def strong_combinations(board, remaining, fraction=4):
+    """La fracción superior de manos (1/fraction), incluidos los empates en el corte."""
     score = (lambda pair: hand_rank(board + pair)) if board else starting_hand_score
     ranked = sorted((score(pair), pair) for pair in combinations(remaining, 2))
-    cutoff = ranked[-(len(ranked) // 4)][0]
+    cutoff = ranked[-(len(ranked) // fraction)][0]
     return tuple(pair for rank, pair in ranked if rank >= cutoff)
-
 
 def estimate_equity(
         situation, samples=2400, *, strong_rival=False, strong_weight=DEFAULT_STRONG_WEIGHT,
+        fraction=4,
 ):
     seen = set(situation.hole + situation.board)
     remaining = [card for card in DECK if card not in seen]
     missing = 5 - len(situation.board)
-    strong_pairs = strong_combinations(situation.board, remaining) if strong_rival else ()
+    strong_pairs = strong_combinations(situation.board, remaining, fraction) if strong_rival else ()
 
     if missing == 0 and situation.opponents == 1:
         hero = hand_rank(situation.board + situation.hole)
@@ -178,6 +183,8 @@ def estimate_equity(
     return share / samples
 
 
+
+
 def decide(situation, *, strong_weight=DEFAULT_STRONG_WEIGHT, facing_raise=False):
     started = time.perf_counter()
     decision, weight = _decide(situation, strong_weight, facing_raise)
@@ -193,46 +200,65 @@ def decide(situation, *, strong_weight=DEFAULT_STRONG_WEIGHT, facing_raise=False
             file=sys.stderr, flush=True,
         )
     return decision
+def _preflop(s, facing_raise):
+    call = s.to_call
+    score = starting_hand_score(s.hole)
+    eq = estimate_equity(replace(s, opponents=min(s.opponents, 2)), samples=600)
+    req = call / (s.pot + call) if call else None
+    can_raise = s.min_raise is not None
+    amount = min(s.stack, max(s.min_raise or 0, 3 * call, s.pot if not call else 0))
+    shove = amount >= s.stack * 0.5
 
+    def dec(action, amt, why):
+        return Decision(action, amt, eq, req, why)
 
+    if facing_raise:
+        if score >= 14 and can_raise:
+            return dec("Subir", amount, "Mano premium: resube por valor.")
+        if score >= 10 and call <= s.stack * 0.15:
+            return dec("Pagar", call, "Mano fuerte: paga la subida.")
+        return dec("Retirarse", 0, "Mano insuficiente contra una subida.")
+    if score >= 9 and can_raise and not (shove and score < 14):
+        return dec("Subir" if call else "Apostar / subir", amount,
+                   "Mano jugable: sube para tomar la iniciativa.")
+    if not call:
+        return dec("Pasar", 0, "Puedes seguir sin poner fichas.")
+    limit = 0.25 if score >= 9 else 0.06
+    if score >= 6 and call <= s.stack * limit:
+        return dec("Pagar", call, "Mano especulativa barata.")
+    return dec("Retirarse", 0, "Mano débil.")
 def _decide(situation, strong_weight, facing_raise):
-    call = situation.to_call
-    large_bet = bool(situation.board) and call > 0 and 2 * call >= situation.pot
-    postflop_raise = bool(situation.board and call and facing_raise)
-    preflop_raise = bool(not situation.board and call and facing_raise)
-    strong_rival = large_bet or postflop_raise or preflop_raise
+    if not situation.board:
+        return _preflop(situation, facing_raise), 0.0
 
-    # Rango rival escalado por tamaño de apuesta postflop
+    call = situation.to_call
+    large_bet = call > 0 and 2 * call >= situation.pot
+    postflop_raise = bool(call and facing_raise)
+    strong_rival = large_bet or postflop_raise
+
     weight = strong_weight if strong_rival else 0.0
-    if call and situation.board and not strong_rival:
+    fraction = 4
+    if call and not strong_rival:
         frac = call / max(1, situation.pot - call)
         weight = min(0.85, 0.25 + 0.55 * frac)
         strong_rival = True
+    if postflop_raise or (large_bet and len(situation.board) >= 4):
+        weight = max(weight, 0.75)
+    if postflop_raise and len(situation.board) >= 4:
+        weight, fraction = max(weight, 0.85), 10
 
-    equity = estimate_equity(situation, strong_rival=strong_rival, strong_weight=weight)
+    equity = estimate_equity(
+        situation, strong_rival=strong_rival, strong_weight=weight, fraction=fraction,
+    )
     required = call / (situation.pot + call) if call else None
+
     reraise_caution = ""
-    if postflop_raise:
-        rank = hand_rank(situation.board + situation.hole)
-        if rank[0] < 2:
-            reraise_caution = "con un par o menos el bot evita resubir"
-        elif rank[0] == 3:
-            trips = rank[1]
-            board_ranks = [CARD_VALUES[card][0] for card in situation.board]
-            if board_ranks.count(trips) == 2:
-                side_card = next(
-                    CARD_VALUES[card][0] for card in situation.hole
-                    if CARD_VALUES[card][0] != trips
-                )
-                if side_card <= LOW_TRIPS_KICKER_MAX and any(
-                        kicker not in board_ranks for kicker in range(rank[-1] + 1, 15)
-                ):
-                    reraise_caution = "otro trío podría ganarte con una carta de desempate más alta"
+    if postflop_raise and hand_rank(situation.board + situation.hole)[0] < 4:
+        reraise_caution = "sin escalera o mejor no resube contra una subida"
 
     raise_min = situation.min_raise
     target = call + max(1, (situation.pot + call) // 2)
 
-    # 1. Apostar / subir por valor (umbrales más exigentes)
     value_threshold = 0.66 if situation.opponents == 1 else 0.55
     if call:
         value_threshold += 0.06
@@ -246,7 +272,7 @@ def _decide(situation, strong_weight, facing_raise):
     ):
         amount = min(situation.stack, max(raise_min, target))
         committed = amount >= situation.stack * 0.5 and situation.pot >= situation.stack * 0.5
-        min_allin_equity = 0.70 if committed else (0.88 if situation.board else 0.84)
+        min_allin_equity = 0.70 if committed else 0.88
         avoid_all_in = bool(amount == situation.stack and equity < min_allin_equity)
         if not avoid_all_in:
             return Decision(
@@ -254,10 +280,8 @@ def _decide(situation, strong_weight, facing_raise):
                 "La mano tiene suficiente fuerza en la simulación para intentar ganar un bote mayor.",
             ), weight
 
-    # 2. Apuesta de presión (1/3 del bote) cuando nadie apostó postflop
     if (
             not call
-            and situation.board
             and raise_min is not None
             and situation.pot > 0
             and equity >= (0.55 if situation.opponents == 1 else 0.45)
@@ -276,9 +300,8 @@ def _decide(situation, strong_weight, facing_raise):
             if avoid_all_in else "Puedes seguir en la mano sin poner más fichas.",
         ), weight
 
-    # 3. Filtro extra preflop para evitar igualar con manos basura
-    call_buffer = 0.08 if not situation.board else 0.0
-    if equity >= required + call_buffer:
+    big = 0.10 if call >= situation.stack * 0.25 else 0.0
+    if equity >= required + big:
         explanation = "Tu parte estimada del bote cubre el coste de igualar la apuesta."
         if reraise_caution:
             explanation = f"La estimación alcanza para igualar, pero {reraise_caution}."
@@ -288,6 +311,5 @@ def _decide(situation, strong_weight, facing_raise):
 
     return Decision(
         "Retirarse", 0, equity, required,
-        "El bot da más peso a manos rivales fuertes. Con esa estimación, igualar cuesta demasiado."
-        if strong_rival else "Igualar cuesta demasiado para la parte del bote que estima el bot.",
+        "El bot da más peso a manos rivales fuertes. Con esa estimación, igualar cuesta demasiado.",
     ), weight
